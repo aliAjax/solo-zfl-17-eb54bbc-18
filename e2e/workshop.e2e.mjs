@@ -504,6 +504,166 @@ await check("源工单取消：共享记录由源单退一次，最终账实一�
 });
 await legacyContext.close();
 
+// 旧数据迁移辅助：独立浏览器上下文 + 预置升级前 localStorage
+async function seedLegacyWorkshop(seed) {
+  const ctx = await browser.newContext({ acceptDownloads: true });
+  await ctx.addInitScript((state) => {
+    if (!localStorage.getItem("zfl17-legacy-seeded")) {
+      localStorage.setItem("zfl17-film-strip-desk", JSON.stringify(state));
+      localStorage.setItem("zfl17-legacy-seeded", "1");
+    }
+  }, seed);
+  const p = await ctx.newPage();
+  p.on("pageerror", (error) => pageErrors.push(`legacy: ${error.message}`));
+  await p.goto(baseUrl, { waitUntil: "load" });
+  return {
+    ctx: ctx,
+    page: p,
+    order: (code) => p.locator(`[data-order-code="${code}"]`),
+    stock: (id) => p.locator(`.material-row[data-material="${id}"] [data-role="stock"]`).textContent(),
+    ledger: (code) => p.locator(`[data-order-code="${code}"] .order-ledger`).textContent(),
+    report: (id) => p.locator(`#${id}`).textContent(),
+    async failTo(code, returnStage) {
+      await p.locator(`[data-order-code="${code}"] select[data-role="return-stage"]`).selectOption(returnStage);
+      await p.locator(`[data-order-code="${code}"] [data-action="fail-review"]`).click();
+    }
+  };
+}
+const legacyMaterials = (clean, tape, glove) => [
+  { id: "clean", name: "清洗液", unit: "瓶", stock: clean[0], consumed: clean[1], refunded: clean[2] },
+  { id: "tape", name: "接片胶带", unit: "卷", stock: tape[0], consumed: tape[1], refunded: tape[2] },
+  { id: "glove", name: "修复手套", unit: "副", stock: glove[0], consumed: glove[1], refunded: glove[2] },
+  { id: "sleeve", name: "归档保护套", unit: "个", stock: 5, consumed: 0, refunded: 0 },
+  { id: "label", name: "归档标签", unit: "张", stock: 5, consumed: 0, refunded: 0 }
+];
+const legacyBase = (segmentId, code, materials) => ({
+  reelTitle: "历史卷",
+  segments: [{ id: segmentId, code, duration: 10, shift: "正常", damage: "齿孔破损", note: "", thumb: "" }],
+  materials,
+  workOrders: [],
+  loans: [],
+  log: [],
+  orderSeq: 10,
+  history: []
+});
+
+// ---------- 场景 12：同形多笔（来源一笔 + 合并后新增同形态一笔） ----------
+console.log("场景 12：旧版合并单同形多笔迁移");
+const sameShapeState = legacyBase("seg-h2", "H-101", legacyMaterials([3, 2, 0], [4, 1, 0], [9, 1, 0]));
+sameShapeState.workOrders = [
+  legacyOrder("WO-1001", "online", "清洗", "active", [legacyEntry("e1", "评估", "glove")], "2026-09-10T08:00:00.000Z"),
+  legacyOrder("WO-1002", "offline", "接片", "merged", [
+    legacyEntry("e1", "评估", "glove"),
+    legacyEntry("e2", "清洗", "clean")
+  ], "2026-09-10T09:00:00.000Z"),
+  legacyOrder("WO-1003", "offline", "清洗", "merged", [legacyEntry("e1", "评估", "glove")], "2026-09-10T10:00:00.000Z"),
+  // 旧版合并单：前 3 笔是来源拼接（e1 出现两次），c4 是合并后新领（与 e2 同工序同物料同数量）
+  legacyOrder("WO-1004", "online", "复检", "active", [
+    legacyEntry("c1", "评估", "glove"),
+    legacyEntry("c2", "清洗", "clean"),
+    legacyEntry("c3", "评估", "glove"),
+    legacyEntry("c4", "清洗", "clean"),
+    legacyEntry("c5", "接片", "tape")
+  ], "2026-09-10T11:00:00.000Z", [
+    { id: "r-merge", stage: "接片", action: "合并", detail: "由 WO-1002 ＋ WO-1003 合并", at: "2026-09-10T11:00:00.000Z" }
+  ])
+];
+{
+  const w = await seedLegacyWorkshop(sameShapeState);
+  await check("迁移后来源一笔与新增同形态一笔都完整保留", async () => {
+    const ledger = await w.ledger("WO-1004");
+    expect(ledger.includes("清洗液×2"), `两笔同形态清洗液都应保留，实际「${ledger.trim()}」`);
+    expect(ledger.includes("修复手套×1（继承）"), `共享手套应去重为一笔继承，实际「${ledger.trim()}」`);
+  });
+  await check("取消旧版合并单：同形两笔都回冲，共享来源不退", async () => {
+    await w.order("WO-1004").locator('[data-action="cancel"]').click();
+    expect((await w.stock("clean")) === "5瓶", `两笔清洗液都应回冲为5瓶，实际${await w.stock("clean")}`);
+    expect((await w.stock("tape")) === "5卷", `胶带应回冲为5卷，实际${await w.stock("tape")}`);
+    expect((await w.stock("glove")) === "9副", `共享手套归源单不应退，实际${await w.stock("glove")}`);
+    await w.order("WO-1001").locator('[data-action="cancel"]').click();
+    expect((await w.stock("glove")) === "10副", `源单取消退共享手套为10副，实际${await w.stock("glove")}`);
+    const expected = [
+      "清洗液｜库存5瓶｜累计消耗2｜累计回冲2",
+      "接片胶带｜库存5卷｜累计消耗1｜累计回冲1",
+      "修复手套｜库存10副｜累计消耗1｜累计回冲1"
+    ];
+    const before = await w.report("reportMaterials");
+    for (const line of expected) expect(before.includes(line), `耗材清单缺「${line}」，实际「${before.trim()}」`);
+    await w.page.reload({ waitUntil: "load" });
+    expect((await w.report("reportMaterials")) === before, "重开后耗材清单应一致");
+  });
+  await w.ctx.close();
+}
+
+// ---------- 场景 13：连续合并（合并单再次被合并） ----------
+console.log("场景 13：旧版连续合并迁移与取消/复检退回");
+const chainedState = legacyBase("seg-h3", "H-102", legacyMaterials([3, 2, 0], [4, 1, 0], [8, 2, 0]));
+chainedState.workOrders = [
+  legacyOrder("WO-2001", "online", "接片", "active", [
+    legacyEntry("e1", "评估", "glove"),
+    legacyEntry("e9", "清洗", "clean"),
+    legacyEntry("e10", "清洗", "glove")
+  ], "2026-09-10T08:00:00.000Z"),
+  legacyOrder("WO-2002", "offline", "清洗", "merged", [legacyEntry("e1", "评估", "glove")], "2026-09-10T09:00:00.000Z"),
+  legacyOrder("WO-2003", "offline", "清洗", "merged", [legacyEntry("e1", "评估", "glove")], "2026-09-10T10:00:00.000Z"),
+  // 第一次旧版合并：前 2 笔是来源拼接，c3 是合并后新领
+  legacyOrder("WO-2004", "online", "接片", "merged", [
+    legacyEntry("c1", "评估", "glove"),
+    legacyEntry("c2", "评估", "glove"),
+    legacyEntry("c3", "清洗", "clean")
+  ], "2026-09-10T11:00:00.000Z", [
+    { id: "r-merge-1", stage: "清洗", action: "合并", detail: "由 WO-2002 ＋ WO-2003 合并", at: "2026-09-10T11:00:00.000Z" }
+  ]),
+  legacyOrder("WO-2005", "offline", "清洗", "merged", [legacyEntry("e1", "评估", "glove")], "2026-09-10T12:00:00.000Z"),
+  // 第二次旧版合并：前 4 笔是来源拼接（WO-2004 的 3 笔 + WO-2005 的 1 笔），d5 是合并后新领
+  legacyOrder("WO-2006", "online", "复检", "active", [
+    legacyEntry("d1", "评估", "glove"),
+    legacyEntry("d2", "评估", "glove"),
+    legacyEntry("d3", "清洗", "clean"),
+    legacyEntry("d4", "评估", "glove"),
+    legacyEntry("d5", "接片", "tape")
+  ], "2026-09-10T13:00:00.000Z", [
+    { id: "r-merge-2", stage: "接片", action: "合并", detail: "由 WO-2004 ＋ WO-2005 合并", at: "2026-09-10T13:00:00.000Z" }
+  ])
+];
+{
+  const w = await seedLegacyWorkshop(chainedState);
+  await check("连续合并迁移：共享记录跨两级只留一笔并归源", async () => {
+    const ledger = await w.ledger("WO-2006");
+    expect((ledger.match(/修复手套/g) || []).length === 1, `共享手套跨两级合并后只应出现一次，实际「${ledger.trim()}」`);
+    expect(ledger.includes("继承"), "共享手套应标记继承");
+    expect(ledger.includes("清洗液×1") && ledger.includes("接片胶带×1"), `上游新增与本单新增都应保留，实际「${ledger.trim()}」`);
+  });
+  await check("连续合并单复检退回：只退本单及转归账目", async () => {
+    await w.failTo("WO-2006", "清洗");
+    expect((await w.stock("clean")) === "4瓶", `清洗液应回冲为4瓶，实际${await w.stock("clean")}`);
+    expect((await w.stock("tape")) === "5卷", `胶带应回冲为5卷，实际${await w.stock("tape")}`);
+    expect((await w.stock("glove")) === "8副", `共享手套不应退，实际${await w.stock("glove")}`);
+  });
+  await check("连续合并单取消与源单取消后账实一致", async () => {
+    await w.order("WO-2001").locator('[data-action="advance"]').click(); // 接片 → 复检
+    expect((await w.stock("tape")) === "4卷", `源单接片应领用胶带为4卷，实际${await w.stock("tape")}`);
+    await w.order("WO-2006").locator('[data-action="advance"]').click(); // 清洗 → 接片
+    await w.order("WO-2006").locator('[data-action="cancel"]').click();
+    expect((await w.stock("clean")) === "4瓶", `合并单取消只退本单清洗液，实际${await w.stock("clean")}`);
+    expect((await w.stock("glove")) === "8副", `合并单取消只退本单手套，实际${await w.stock("glove")}`);
+    await w.order("WO-2001").locator('[data-action="cancel"]').click();
+    expect((await w.stock("glove")) === "10副", `源单取消后手套应为10副，实际${await w.stock("glove")}`);
+    expect((await w.stock("clean")) === "5瓶", `清洗液应为5瓶，实际${await w.stock("clean")}`);
+    expect((await w.stock("tape")) === "5卷", `胶带应为5卷，实际${await w.stock("tape")}`);
+    const expected = [
+      "清洗液｜库存5瓶｜累计消耗3｜累计回冲3",
+      "接片胶带｜库存5卷｜累计消耗2｜累计回冲2",
+      "修复手套｜库存10副｜累计消耗3｜累计回冲3"
+    ];
+    const before = await w.report("reportMaterials");
+    for (const line of expected) expect(before.includes(line), `耗材清单缺「${line}」，实际「${before.trim()}」`);
+    await w.page.reload({ waitUntil: "load" });
+    expect((await w.report("reportMaterials")) === before, "重开后耗材清单应一致");
+  });
+  await w.ctx.close();
+}
+
 await browser.close();
 server.close();
 

@@ -149,14 +149,19 @@ function migrate(target) {
     });
   });
 
-  // 旧版合并单的台账是拼接后重新生成 id 的：按两张来源工单的台账去重重建，
-  // 合并后本单新领的（与来源账目对不上的）保留为本单所有
-  orders.forEach((order) => {
-    const ledger = order.ledger || [];
-    if (!ledger.length || ledger.some((entry) => entry.origin)) return;
-    const sources = parseMergeSources(order);
-    if (!sources) return;
-    const [sourceA, sourceB] = sources.map((code) => byCode.get(code));
+  // 旧版合并单的台账结构：前段是两张来源工单台账的按序拼接（id 被重新生成），
+  // 尾段是合并后本单新领的。按来源工单原始长度切出尾部新增（同形态也完整保留）；
+  // 前段用来源工单（可能已重建）的台账按条目 id 去重还原，共享条目只留一笔。
+  // 连续合并时按建单时间先重建上游，保证下游读到的是去重后的来源台账与原始切分长度。
+  const originalLengths = new Map(orders.map((order) => [order.id, (order.ledger || []).length]));
+  const legacyMerged = orders
+    .filter((order) => {
+      const ledger = order.ledger || [];
+      return ledger.length > 0 && ledger.every((entry) => !entry.origin) && parseMergeSources(order);
+    })
+    .sort((a, b) => String(a.createdAt || "").localeCompare(String(b.createdAt || "")) || a.code.localeCompare(b.code));
+  legacyMerged.forEach((order) => {
+    const [sourceA, sourceB] = parseMergeSources(order).map((code) => byCode.get(code));
     if (!sourceA || !sourceB) return;
     const union = [];
     const seen = new Set();
@@ -165,14 +170,9 @@ function migrate(target) {
       seen.add(entry.id);
       union.push(entry);
     });
-    const rebuilt = [...union];
-    ledger.forEach((entry) => {
-      const duplicated = union.some(
-        (item) => item.stage === entry.stage && item.materialId === entry.materialId && item.qty === entry.qty
-      );
-      if (!duplicated) rebuilt.push(entry);
-    });
-    order.ledger = rebuilt;
+    const splitAt = (originalLengths.get(sourceA.id) || 0) + (originalLengths.get(sourceB.id) || 0);
+    const additions = order.ledger.slice(Math.min(splitAt, order.ledger.length));
+    order.ledger = [...union, ...additions];
   });
 
   // 全局归属：同一台账标识出现在多张工单时，归最早实际领用的工单；已合并的顺延给合并单
