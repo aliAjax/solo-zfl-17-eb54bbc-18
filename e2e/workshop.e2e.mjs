@@ -284,6 +284,96 @@ await check("撤销归档后待修清单回滚，刷新与重开后报表一致"
   expect((await page.locator("#quarantineCount").textContent()) === "1", "重开后隔离数仍为1");
 });
 
+// ---------- 场景 7：未合并离线副本取消，只回冲自己新增的耗材 ----------
+console.log("场景 7：离线副本取消不回冲继承台账");
+await check("副本台账标记继承，取消只退本单新增", async () => {
+  await adjustMaterial("clean", "mat-plus", 2); // 清洗液 0 → 2
+  await orderCard("WO-0004").locator('[data-action="copy-offline"]').click(); // WO-0008
+  await expectText(orderCard("WO-0008").locator(".order-ledger"), "继承", "副本台账继承标记");
+  await advance("WO-0008"); // 清洗 → 接片（本单新领清洗液+手套）
+  expect((await materialStock("clean")) === "1瓶", `清洗液应为1瓶，实际${await materialStock("clean")}`);
+  expect((await materialStock("glove")) === "2副", `手套应为2副，实际${await materialStock("glove")}`);
+  await orderCard("WO-0008").locator('[data-action="cancel"]').click();
+  await expectText(page.locator("#workshopMsg"), "回冲", "取消回冲提示");
+  expect((await materialStock("clean")) === "2瓶", `清洗液应回冲为2瓶，实际${await materialStock("clean")}`);
+  expect((await materialStock("glove")) === "3副", `手套只退本单新增的1副应为3副，实际${await materialStock("glove")}`);
+  expect(!(await orderCard("WO-0004").locator(".order-ledger").textContent()).includes("已回冲"), "源工单台账不应被副本回冲");
+});
+
+// ---------- 场景 8：源工单与副本分别取消，各自只退自己的 ----------
+console.log("场景 8：源工单与未合并副本分别取消");
+await check("副本取消时其继承条目不再退款", async () => {
+  await orderCard("WO-0004").locator('[data-action="copy-offline"]').click(); // WO-0009
+  await orderCard("WO-0004").locator('[data-action="cancel"]').click(); // 源单退自己的评估手套
+  expect((await materialStock("glove")) === "4副", `源单取消后手套应为4副，实际${await materialStock("glove")}`);
+  await orderCard("WO-0009").locator('[data-action="cancel"]').click(); // 副本无本单新增，不退
+  expect((await materialStock("glove")) === "4副", `副本取消不应再退手套，实际${await materialStock("glove")}`);
+  expect(!(await msg()).includes("回冲"), "无本单新增时取消提示不应含回冲");
+});
+
+// ---------- 场景 9：合并后取消，共享来源台账不重复回冲 ----------
+console.log("场景 9：合并后取消（共享来源 vs 分支新增）");
+await check("合并台账共享来源去重，取消只退分支新增", async () => {
+  await createOrderFor("B-001"); // WO-0010 → 评估
+  await advance("WO-0010"); // → 清洗
+  await orderCard("WO-0010").locator('[data-action="copy-offline"]').click(); // WO-0011
+  await orderCard("WO-0010").locator('[data-action="copy-offline"]').click(); // WO-0012
+  await advance("WO-0011"); // 离线：清洗 → 接片
+  await page.selectOption("#mergeA", { label: "WO-0011｜B-001｜接片" });
+  await page.selectOption("#mergeB", { label: "WO-0012｜B-001｜清洗" });
+  await page.click("#mergePreviewBtn");
+  await expectText(page.locator("#mergePreview"), "待裁决冲突（0）", "无冲突合并");
+  await page.click("#mergeConfirmBtn");
+  expect(await stageOf("WO-0013") === "接片", "WO-0013 应并入接片");
+  const ledgerText = await orderCard("WO-0013").locator(".order-ledger").textContent();
+  expect(ledgerText.includes("继承"), "合并台账应标记共享来源为继承");
+  expect(!ledgerText.includes("×2（继承"), `共享来源台账不应重复入账，实际「${ledgerText.trim()}」`);
+  await orderCard("WO-0013").locator('[data-action="cancel"]').click();
+  expect((await materialStock("clean")) === "2瓶", `合并单取消只退分支新增清洗液，实际${await materialStock("clean")}`);
+  expect((await materialStock("glove")) === "3副", `合并单取消不应退共享来源手套，实际${await materialStock("glove")}`);
+  expect(!(await orderCard("WO-0010").locator(".order-ledger").textContent()).includes("已回冲"), "来源工单台账不应被合并单回冲");
+  await orderCard("WO-0010").locator('[data-action="cancel"]').click();
+  expect((await materialStock("glove")) === "4副", `来源工单取消退自己的手套，实际${await materialStock("glove")}`);
+});
+
+// ---------- 场景 10：合并后复检退回，只回冲本单新增且库存台账一致 ----------
+console.log("场景 10：合并后复检退回与最终账实一致");
+await check("合并单复检退回只回冲本单新增，最终库存与台账一致", async () => {
+  await adjustMaterial("clean", "mat-plus", 2); // 清洗液 2 → 4
+  await createOrderFor("A-012"); // WO-0014 → 评估
+  await advance("WO-0014"); // → 清洗
+  await orderCard("WO-0014").locator('[data-action="copy-offline"]').click(); // WO-0015
+  await orderCard("WO-0014").locator('[data-action="copy-offline"]').click(); // WO-0016
+  await advance("WO-0015"); // → 接片
+  await advance("WO-0015"); // → 复检
+  await advance("WO-0016"); // → 接片
+  await page.selectOption("#mergeA", { label: "WO-0015｜A-012｜复检" });
+  await page.selectOption("#mergeB", { label: "WO-0016｜A-012｜接片" });
+  await page.click("#mergePreviewBtn");
+  await page.click("#mergeConfirmBtn");
+  expect(await stageOf("WO-0017") === "复检", "WO-0017 应并入复检");
+  await advance("WO-0014"); // 清洗 → 接片（腾出清洗槽）
+  await failReviewTo("WO-0017", "清洗");
+  expect(await stageOf("WO-0017") === "清洗", "WO-0017 应退回清洗");
+  expect((await materialStock("clean")) === "3瓶", `退回只回冲本单清洗液，实际${await materialStock("clean")}`);
+  expect((await materialStock("glove")) === "2副", `退回只回冲本单手套，实际${await materialStock("glove")}`);
+  expect((await materialStock("tape")) === "3卷", `退回只回冲本单胶带，实际${await materialStock("tape")}`);
+  expect(!(await orderCard("WO-0014").locator(".order-ledger").textContent()).includes("已回冲"), "共享来源台账不应被合并单退回回冲");
+  await orderCard("WO-0014").locator('[data-action="cancel"]').click();
+  expect((await materialStock("glove")) === "4副", `来源工单取消退自己的手套，实际${await materialStock("glove")}`);
+  const expected = [
+    "清洗液｜库存4瓶｜累计消耗9｜累计回冲7",
+    "接片胶带｜库存3卷｜累计消耗6｜累计回冲4",
+    "修复手套｜库存4副｜累计消耗17｜累计回冲11",
+    "归档保护套｜库存0个｜累计消耗1｜累计回冲0",
+    "归档标签｜库存4张｜累计消耗1｜累计回冲0"
+  ];
+  const before = await reportText("reportMaterials");
+  for (const line of expected) expect(before.includes(line), `耗材清单缺「${line}」，实际「${before.trim()}」`);
+  await page.reload({ waitUntil: "load" });
+  expect((await reportText("reportMaterials")) === before, "重开后耗材清单应一致");
+});
+
 await browser.close();
 server.close();
 

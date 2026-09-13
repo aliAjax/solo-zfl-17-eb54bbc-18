@@ -117,13 +117,23 @@ const els = {
 
 function loadState() {
   const saved = localStorage.getItem(storageKey);
-  if (!saved) return structuredClone(defaultState);
+  if (!saved) return migrate(structuredClone(defaultState));
   try {
     const parsed = JSON.parse(saved);
-    return { ...structuredClone(defaultState), ...parsed, history: parsed.history || [] };
+    return migrate({ ...structuredClone(defaultState), ...parsed, history: parsed.history || [] });
   } catch {
-    return structuredClone(defaultState);
+    return migrate(structuredClone(defaultState));
   }
+}
+
+// 旧数据兼容：没有 origin 的台账条目视为本单领用
+function migrate(target) {
+  (target.workOrders || []).forEach((order) => {
+    (order.ledger || []).forEach((entry) => {
+      if (!entry.origin) entry.origin = order.id;
+    });
+  });
+  return target;
 }
 
 function saveState() {
@@ -147,7 +157,7 @@ function undo() {
   }
   const snapshot = state.history.pop();
   const history = state.history;
-  state = { ...JSON.parse(snapshot), history };
+  state = migrate({ ...JSON.parse(snapshot), history });
   renderAll();
   showMsg("已撤销上一步操作。", "ok");
 }
@@ -222,6 +232,7 @@ function deductMaterials(order, costs, stage) {
     material.consumed += cost.qty;
     order.ledger.push({
       id: crypto.randomUUID(),
+      origin: order.id,
       stage,
       materialId: cost.material,
       qty: cost.qty,
@@ -230,11 +241,13 @@ function deductMaterials(order, costs, stage) {
   });
 }
 
+// 只回冲本单实际领用（origin 是本单）且未退的条目；继承自其他工单的台账不在此退款
 function refundStages(order, fromStage) {
   const fromIndex = STAGES.indexOf(fromStage);
   const refunded = [];
   order.ledger.forEach((entry) => {
-    if (entry.refunded || STAGES.indexOf(entry.stage) < fromIndex) return;
+    if (entry.refunded || entry.origin !== order.id) return;
+    if (STAGES.indexOf(entry.stage) < fromIndex) return;
     const material = findMaterial(entry.materialId);
     material.stock += entry.qty;
     material.refunded += entry.qty;
@@ -537,6 +550,14 @@ function buildMergePlan(orderA, orderB) {
   });
 
   const further = STAGES.indexOf(orderA.stage) >= STAGES.indexOf(orderB.stage) ? orderA : orderB;
+  // 台账按条目 id 去重：两个分支从同一来源继承的条目是同一笔物理消耗，只保留一笔
+  const seenLedger = new Set();
+  const ledger = [];
+  [...orderA.ledger, ...orderB.ledger].forEach((entry) => {
+    if (seenLedger.has(entry.id)) return;
+    seenLedger.add(entry.id);
+    ledger.push({ ...entry });
+  });
   return {
     aId: orderA.id,
     bId: orderB.id,
@@ -547,7 +568,7 @@ function buildMergePlan(orderA, orderB) {
     records,
     findings,
     conflicts,
-    ledger: [...orderA.ledger, ...orderB.ledger].map((entry) => ({ ...entry, id: crypto.randomUUID() }))
+    ledger
   };
 }
 
@@ -622,8 +643,9 @@ function confirmMerge() {
     return;
   }
   pushHistory();
+  const mergedId = crypto.randomUUID();
   const merged = {
-    id: crypto.randomUUID(),
+    id: mergedId,
     code: nextOrderCode(),
     segmentId: plan.segmentId,
     source: "online",
@@ -633,7 +655,11 @@ function confirmMerge() {
     reworkCount: plan.reworkCount,
     findings: [...plan.findings, ...adjudicated],
     records: plan.records,
-    ledger: plan.ledger,
+    // 分支新增的账目随合并转归本单；共享来源（第三方工单）的账目仍归原工单退款
+    ledger: plan.ledger.map((entry) => ({
+      ...entry,
+      origin: entry.origin === plan.aId || entry.origin === plan.bId ? mergedId : entry.origin
+    })),
     createdAt: now()
   };
   addRecord(merged, merged.stage, "合并", `由 ${orderA.code} ＋ ${orderB.code} 合并`);
@@ -791,13 +817,15 @@ function ledgerSummary(order) {
   if (!order.ledger.length) return "尚未领用耗材";
   const grouped = new Map();
   order.ledger.forEach((entry) => {
-    const key = `${entry.materialId}:${entry.refunded}`;
+    const inherited = Boolean(entry.origin) && entry.origin !== order.id;
+    const key = `${entry.materialId}:${entry.refunded}:${inherited}`;
     grouped.set(key, (grouped.get(key) || 0) + entry.qty);
   });
   return [...grouped.entries()]
     .map(([key, qty]) => {
-      const [materialId, refunded] = key.split(":");
-      return `${materialName(materialId)}×${qty}${refunded === "true" ? "（已回冲）" : ""}`;
+      const [materialId, refunded, inherited] = key.split(":");
+      const marks = [refunded === "true" ? "已回冲" : "", inherited === "true" ? "继承" : ""].filter(Boolean);
+      return `${materialName(materialId)}×${qty}${marks.length ? `（${marks.join("·")}）` : ""}`;
     })
     .join("、");
 }
