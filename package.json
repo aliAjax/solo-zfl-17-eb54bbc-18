@@ -1,0 +1,12 @@
+{
+  "name": "film-workshop-desk",
+  "private": true,
+  "version": "1.0.0",
+  "description": "胶片修复车间台：核对台 + 修复工单流转",
+  "scripts": {
+    "test:e2e": "node e2e/workshop.e2e.mjs"
+  },
+  "devDependencies": {
+    "playwright": "^1.63.0"
+  }
+}

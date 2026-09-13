@@ -3,15 +3,15 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>胶片分镜条核对台</title>
+    <title>胶片修复车间台</title>
     <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
     <main class="shell">
       <header class="hero">
         <div>
-          <p class="eyebrow">纸质放映胶片整理</p>
-          <h1>胶片分镜条核对台</h1>
+          <p class="eyebrow">纸质放映胶片整理 · 修复车间</p>
+          <h1>胶片修复车间台</h1>
         </div>
         <div class="hero-stats">
           <div>
@@ -25,6 +25,14 @@
           <div>
             <span>片段数</span>
             <strong id="segmentCount">0</strong>
+          </div>
+          <div>
+            <span>进行中工单</span>
+            <strong id="activeOrderCount">0</strong>
+          </div>
+          <div>
+            <span>隔离工单</span>
+            <strong id="quarantineCount">0</strong>
           </div>
         </div>
       </header>
@@ -49,7 +57,11 @@
           搜索
           <input id="searchInput" type="search" placeholder="片段编号或备注" />
         </label>
-        <button id="exportBtn">导出清单</button>
+        <div class="toolbar-actions">
+          <button id="undoBtn" type="button">撤销</button>
+          <button id="exportBtn" type="button">导出清单</button>
+          <button id="exportReportBtn" type="button">导出车间报表</button>
+        </div>
       </section>
 
       <section class="layout">
@@ -99,7 +111,7 @@
         <section class="panel list-panel">
           <div class="panel-head">
             <h2>放映顺序</h2>
-            <span>拖拽片段调整顺序</span>
+            <span>拖拽片段调整顺序，受损片段可建工单</span>
           </div>
           <div id="segmentList" class="segment-list"></div>
         </section>
@@ -108,6 +120,89 @@
           <h2>试映前核对</h2>
           <div id="warningList" class="warning-list"></div>
         </aside>
+      </section>
+
+      <section class="workshop">
+        <div class="section-head">
+          <div>
+            <p class="eyebrow">评估 → 清洗 → 接片 → 复检 → 归档</p>
+            <h2>修复车间</h2>
+          </div>
+          <p id="workshopMsg" class="workshop-msg" role="status"></p>
+        </div>
+
+        <div id="stationBoard" class="station-board"></div>
+
+        <div class="workshop-grid">
+          <section class="panel orders-panel">
+            <div class="panel-head">
+              <h2>修复工单</h2>
+              <span>每个工位同时只能有一张工单</span>
+            </div>
+            <div id="orderList" class="order-list"></div>
+          </section>
+
+          <aside class="panel">
+            <h2>耗材库存</h2>
+            <div id="materialList" class="material-list"></div>
+            <h2 class="subhead">借出登记</h2>
+            <form id="loanForm" class="loan-form">
+              <label>
+                片段
+                <select id="loanSegment"></select>
+              </label>
+              <label>
+                借出人
+                <input id="loanBorrower" required placeholder="放映组 / 姓名" />
+              </label>
+              <button type="submit">登记借出</button>
+            </form>
+            <div id="loanList" class="loan-list"></div>
+          </aside>
+
+          <aside class="panel">
+            <h2>离线工单合并</h2>
+            <div class="merge-form">
+              <label>
+                离线工单 A
+                <select id="mergeA"></select>
+              </label>
+              <label>
+                离线工单 B
+                <select id="mergeB"></select>
+              </label>
+              <button id="mergePreviewBtn" type="button">预检合并</button>
+              <div id="mergePreview" class="merge-preview"></div>
+            </div>
+            <h2 class="subhead">操作日志</h2>
+            <div id="logList" class="log-list"></div>
+          </aside>
+        </div>
+
+        <section class="panel reports-panel">
+          <div class="panel-head">
+            <h2>车间报表</h2>
+            <span>撤销、刷新、重开后保持一致</span>
+          </div>
+          <div class="reports-grid">
+            <div class="report-block">
+              <h3>待修清单</h3>
+              <ul id="reportPending" class="report-list"></ul>
+            </div>
+            <div class="report-block">
+              <h3>隔离清单</h3>
+              <ul id="reportQuarantine" class="report-list"></ul>
+            </div>
+            <div class="report-block">
+              <h3>返工清单</h3>
+              <ul id="reportRework" class="report-list"></ul>
+            </div>
+            <div class="report-block">
+              <h3>耗材清单</h3>
+              <ul id="reportMaterials" class="report-list"></ul>
+            </div>
+          </div>
+        </section>
       </section>
     </main>
 
