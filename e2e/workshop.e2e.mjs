@@ -374,6 +374,136 @@ await check("合并单复检退回只回冲本单新增，最终库存与台账�
   expect((await reportText("reportMaterials")) === before, "重开后耗材清单应一致");
 });
 
+// ---------- 场景 11：旧版本地数据升级迁移 ----------
+console.log("场景 11：旧版本地数据升级（共享台账归源、旧版合并单重建）");
+const legacyEntry = (id, stage, materialId) => ({ id, stage, materialId, qty: 1, refunded: false });
+const legacyOrder = (code, source, stage, status, ledger, createdAt, records = []) => ({
+  id: `legacy-${code}`,
+  code,
+  segmentId: "seg-h1",
+  source,
+  stage,
+  status,
+  reviewPassed: false,
+  reworkCount: 0,
+  findings: [{ item: "齿孔", conclusion: "中度" }],
+  records,
+  ledger,
+  createdAt
+});
+const legacyState = {
+  reelTitle: "历史卷",
+  segments: [{ id: "seg-h1", code: "H-001", duration: 10, shift: "正常", damage: "齿孔破损", note: "", thumb: "" }],
+  materials: [
+    { id: "clean", name: "清洗液", unit: "瓶", stock: 3, consumed: 2, refunded: 0 },
+    { id: "tape", name: "接片胶带", unit: "卷", stock: 3, consumed: 2, refunded: 0 },
+    { id: "glove", name: "修复手套", unit: "副", stock: 7, consumed: 3, refunded: 0 },
+    { id: "sleeve", name: "归档保护套", unit: "个", stock: 5, consumed: 0, refunded: 0 },
+    { id: "label", name: "归档标签", unit: "张", stock: 5, consumed: 0, refunded: 0 }
+  ],
+  workOrders: [
+    // 源工单：评估/清洗/接片都已领用，停在复检
+    legacyOrder("WO-0001", "online", "复检", "active", [
+      legacyEntry("e1", "评估", "glove"),
+      legacyEntry("e6", "清洗", "clean"),
+      legacyEntry("e7", "清洗", "glove"),
+      legacyEntry("e8", "接片", "tape")
+    ], "2026-09-10T08:00:00.000Z"),
+    // 旧版离线副本：与源单共享 e1，自己新增 e2/e3；后被合并
+    legacyOrder("WO-0002", "offline", "接片", "merged", [
+      legacyEntry("e1", "评估", "glove"),
+      legacyEntry("e2", "清洗", "clean"),
+      legacyEntry("e3", "清洗", "glove")
+    ], "2026-09-10T09:00:00.000Z"),
+    // 旧版离线副本：只共享 e1；后被合并
+    legacyOrder("WO-0003", "offline", "清洗", "merged", [legacyEntry("e1", "评估", "glove")], "2026-09-10T10:00:00.000Z"),
+    // 旧版合并单：台账是拼接后重新生成 id 的（e1 出现两次），合并后新领 n5
+    legacyOrder("WO-0004", "online", "复检", "active", [
+      legacyEntry("n1", "评估", "glove"),
+      legacyEntry("n2", "清洗", "clean"),
+      legacyEntry("n3", "清洗", "glove"),
+      legacyEntry("n4", "评估", "glove"),
+      legacyEntry("n5", "接片", "tape")
+    ], "2026-09-10T11:00:00.000Z", [
+      { id: "r-merge", stage: "接片", action: "合并", detail: "由 WO-0002 ＋ WO-0003 合并", at: "2026-09-10T11:00:00.000Z" }
+    ]),
+    // 未合并的旧版离线副本：只共享 e1
+    legacyOrder("WO-0005", "offline", "清洗", "active", [legacyEntry("e1", "评估", "glove")], "2026-09-10T12:00:00.000Z")
+  ],
+  loans: [],
+  log: [],
+  orderSeq: 6,
+  history: []
+};
+const legacyContext = await browser.newContext({ acceptDownloads: true });
+await legacyContext.addInitScript((seed) => {
+  if (!localStorage.getItem("zfl17-legacy-seeded")) {
+    localStorage.setItem("zfl17-film-strip-desk", JSON.stringify(seed));
+    localStorage.setItem("zfl17-legacy-seeded", "1");
+  }
+}, legacyState);
+const lp = await legacyContext.newPage();
+lp.on("pageerror", (error) => pageErrors.push(`legacy: ${error.message}`));
+await lp.goto(baseUrl, { waitUntil: "load" });
+const lOrder = (code) => lp.locator(`[data-order-code="${code}"]`);
+const lStock = (id) => lp.locator(`.material-row[data-material="${id}"] [data-role="stock"]`).textContent();
+const lMsg = () => lp.locator("#workshopMsg").textContent();
+const lLedger = (code) => lOrder(code).locator(".order-ledger").textContent();
+async function lFail(code, returnStage) {
+  await lOrder(code).locator('select[data-role="return-stage"]').selectOption(returnStage);
+  await lOrder(code).locator('[data-action="fail-review"]').click();
+}
+
+await check("迁移后共享台账归源并标记继承，旧版合并单台账去重", async () => {
+  await expectText(lOrder("WO-0005").locator(".order-ledger"), "继承", "旧副本共享条目标记");
+  const merged = await lLedger("WO-0004");
+  expect(merged.includes("继承"), "旧版合并单应标记继承");
+  expect(!merged.includes("×2（继承"), `旧版合并单共享台账不应重复入账，实际「${merged.trim()}」`);
+});
+await check("取消未合并旧副本：共享记录归源单，副本不多退", async () => {
+  await lOrder("WO-0005").locator('[data-action="cancel"]').click();
+  expect((await lStock("glove")) === "7副", `副本取消不应退源单手套，实际${await lStock("glove")}`);
+  expect(!(await lMsg()).includes("回冲"), "无本单新增时取消提示不应含回冲");
+});
+await check("旧版合并单复检退回：只退转归本单的账目，共享来源不退", async () => {
+  await lFail("WO-0004", "清洗");
+  expect((await lStock("clean")) === "4瓶", `清洗液应回冲为4瓶，实际${await lStock("clean")}`);
+  expect((await lStock("glove")) === "8副", `手套应回冲为8副，实际${await lStock("glove")}`);
+  expect((await lStock("tape")) === "4卷", `胶带应回冲为4卷，实际${await lStock("tape")}`);
+  expect(!(await lLedger("WO-0001")).includes("已回冲"), "源单台账不应被合并单退回回冲");
+});
+await check("源工单退回与推进不受影响", async () => {
+  await lFail("WO-0001", "接片");
+  expect((await lStock("tape")) === "5卷", `源单退回应回冲胶带为5卷，实际${await lStock("tape")}`);
+  await lOrder("WO-0001").locator('[data-action="advance"]').click(); // 接片 → 复检
+  expect((await lStock("tape")) === "4卷", `源单再接片应领用胶带为4卷，实际${await lStock("tape")}`);
+});
+await check("旧版合并单取消：只退本单新增，共享来源仍归源单", async () => {
+  await lOrder("WO-0004").locator('[data-action="advance"]').click(); // 清洗 → 接片
+  await lOrder("WO-0004").locator('[data-action="cancel"]').click();
+  expect((await lStock("clean")) === "4瓶", `合并单取消只退本单清洗液，实际${await lStock("clean")}`);
+  expect((await lStock("glove")) === "8副", `合并单取消只退本单手套，实际${await lStock("glove")}`);
+  expect(!(await lLedger("WO-0001")).includes("手套×2（已回冲"), "源单手套台账不应被合并单回冲");
+});
+await check("源工单取消：共享记录由源单退一次，最终账实一致", async () => {
+  await lOrder("WO-0001").locator('[data-action="cancel"]').click();
+  expect((await lStock("glove")) === "10副", `源单取消后手套应为10副，实际${await lStock("glove")}`);
+  expect((await lStock("clean")) === "5瓶", `清洗液应为5瓶，实际${await lStock("clean")}`);
+  expect((await lStock("tape")) === "5卷", `胶带应为5卷，实际${await lStock("tape")}`);
+  const expected = [
+    "清洗液｜库存5瓶｜累计消耗3｜累计回冲3",
+    "接片胶带｜库存5卷｜累计消耗3｜累计回冲3",
+    "修复手套｜库存10副｜累计消耗4｜累计回冲4",
+    "归档保护套｜库存5个｜累计消耗0｜累计回冲0",
+    "归档标签｜库存5张｜累计消耗0｜累计回冲0"
+  ];
+  const before = await lp.locator("#reportMaterials").textContent();
+  for (const line of expected) expect(before.includes(line), `耗材清单缺「${line}」，实际「${before.trim()}」`);
+  await lp.reload({ waitUntil: "load" });
+  expect((await lp.locator("#reportMaterials").textContent()) === before, "重开后耗材清单应一致");
+});
+await legacyContext.close();
+
 await browser.close();
 server.close();
 

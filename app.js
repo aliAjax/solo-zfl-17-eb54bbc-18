@@ -126,11 +126,79 @@ function loadState() {
   }
 }
 
-// 旧数据兼容：没有 origin 的台账条目视为本单领用
+// 旧数据迁移：为没有 origin 的台账补登归属。
+// 同一台账标识（条目 id）出现在多张工单时，归最早实际领用的工单；
+// 已合并工单拥有的账目顺延给合并单；旧版合并单的拼接台账按来源工单重建去重。
 function migrate(target) {
-  (target.workOrders || []).forEach((order) => {
+  const orders = target.workOrders || [];
+  const byCode = new Map(orders.map((order) => [order.code, order]));
+
+  const parseMergeSources = (order) => {
+    const record = (order.records || []).find((item) => item.action === "合并");
+    const match = record ? /由\s*(.+?)\s*＋\s*(.+?)\s*合并/.exec(record.detail || "") : null;
+    return match ? [match[1], match[2]] : null;
+  };
+
+  // 合并血缘：分支工单 → 合并单
+  const mergeFlow = new Map();
+  orders.forEach((order) => {
+    const sources = parseMergeSources(order);
+    if (!sources) return;
+    sources.forEach((code) => {
+      if (byCode.has(code)) mergeFlow.set(code, order);
+    });
+  });
+
+  // 旧版合并单的台账是拼接后重新生成 id 的：按两张来源工单的台账去重重建，
+  // 合并后本单新领的（与来源账目对不上的）保留为本单所有
+  orders.forEach((order) => {
+    const ledger = order.ledger || [];
+    if (!ledger.length || ledger.some((entry) => entry.origin)) return;
+    const sources = parseMergeSources(order);
+    if (!sources) return;
+    const [sourceA, sourceB] = sources.map((code) => byCode.get(code));
+    if (!sourceA || !sourceB) return;
+    const union = [];
+    const seen = new Set();
+    [...(sourceA.ledger || []), ...(sourceB.ledger || [])].forEach((entry) => {
+      if (seen.has(entry.id)) return;
+      seen.add(entry.id);
+      union.push(entry);
+    });
+    const rebuilt = [...union];
+    ledger.forEach((entry) => {
+      const duplicated = union.some(
+        (item) => item.stage === entry.stage && item.materialId === entry.materialId && item.qty === entry.qty
+      );
+      if (!duplicated) rebuilt.push(entry);
+    });
+    order.ledger = rebuilt;
+  });
+
+  // 全局归属：同一台账标识出现在多张工单时，归最早实际领用的工单；已合并的顺延给合并单
+  const entryHolders = new Map();
+  orders.forEach((order) => {
     (order.ledger || []).forEach((entry) => {
-      if (!entry.origin) entry.origin = order.id;
+      if (!entryHolders.has(entry.id)) entryHolders.set(entry.id, []);
+      entryHolders.get(entry.id).push(order);
+    });
+  });
+  const resolveOwner = (candidates) => {
+    const sorted = candidates
+      .slice()
+      .sort((a, b) => String(a.createdAt || "").localeCompare(String(b.createdAt || "")) || a.code.localeCompare(b.code));
+    let owner = sorted[0];
+    const visited = new Set();
+    while (owner && owner.status === "merged" && mergeFlow.has(owner.code) && !visited.has(owner.code)) {
+      visited.add(owner.code);
+      owner = mergeFlow.get(owner.code);
+    }
+    return owner || sorted[0];
+  };
+  orders.forEach((order) => {
+    (order.ledger || []).forEach((entry) => {
+      if (entry.origin) return;
+      entry.origin = resolveOwner(entryHolders.get(entry.id) || [order]).id;
     });
   });
   return target;
